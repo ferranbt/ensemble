@@ -1,0 +1,87 @@
+name: boltzgen-binder
+description: >
+  The de novo binder loop with BoltzGen in place of RFdiffusion plus
+  ProteinMPNN. BoltzGen's designs arrive with sequences, so there is no separate
+  sequence design step; everything after is unchanged. The refold comparison is
+  weaker evidence here, since BoltzGen's own output is already a Boltz refold.
+
+inputs:
+  target_uri:
+    type: string
+    required: true
+    description: The target structure in S3, `.pdb` or `.cif`.
+  target_chain:
+    type: string
+    default: A
+    description: Which chain to bind. BoltzGen keeps this chain's id in its output.
+  hotspots:
+    type: array
+    default: []
+    description: >
+      Target residues to aim at, in the file's own numbering. BoltzGen indexes
+      canonically from 1 internally; the tool translates for you.
+  binder_length:
+    type: string
+    default: "80-140"
+    description: Residues to generate, as "100" or a range.
+  num_designs:
+    type: integer
+    default: 10
+    description: >
+      How many ranked designs come back, and so how many refolds follow. This
+      is the cost control for the whole run.
+  candidates:
+    type: integer
+    default: 20
+    description: Designs generated before filtering down to `num_designs`.
+
+steps:
+  - id: designs
+    tool: boltzgen/design_binders
+    emits: designs
+    params:
+      target_uri: ${inputs.target_uri}
+      target_chain: ${inputs.target_chain}
+      hotspots: ${inputs.hotspots}
+      binder_length: ${inputs.binder_length}
+      num_designs: ${inputs.num_designs}
+      candidates: ${inputs.candidates}
+
+  # No `limit` here: BoltzGen's own budget already decided how many designs
+  # exist, so the ceiling belongs on the generator rather than downstream.
+  - id: fold
+    tool: boltz/predict_complex
+    needs: [designs]
+    for_each: designs
+    params:
+      chains: ${item.sequences}
+      default_msa: colabfold
+      samples: 1
+
+  - id: selfconsistency
+    tool: rmsd/compare_structures
+    needs: [fold]
+    for_each: fold
+    params:
+      reference_uri: ${item.carried.designs.structure_uri}
+      subject_uri: ${item.best.structure_uri}
+      align: ${inputs.target_chain}
+      measure: ${item.carried.designs.binder_chain}
+
+  - id: interface
+    tool: ipsae/score_interface
+    needs: [selfconsistency]
+    for_each: selfconsistency
+    params:
+      structure_uri: ${item.subject_uri}
+
+output:
+  from: interface
+  order_by: best.ipSAE desc
+  select:
+    - carried.selfconsistency.rmsd
+    - carried.selfconsistency.align_rmsd
+    - best.ipSAE
+    - best.pDockQ
+    - carried.designs.structure_uri
+    - structure_uri

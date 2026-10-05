@@ -1,0 +1,132 @@
+name: scaffold-library
+description: >
+  Generate backbones from nothing, design sequences for them, predict those
+  sequences back, and judge the survivors four ways: does the prediction return
+  to the backbone, is the model confident, does an energy function like the
+  packing, and does it look like a protein. No target and no interface scores.
+
+inputs:
+  length:
+    type: string
+    default: "80-120"
+    description: Residues per backbone, as "100" or a range that varies per design.
+  num_backbones:
+    type: integer
+    default: 12
+    description: >
+      Backbones to generate. Yield is what decides how many are needed, and
+      that is the first thing a run measures.
+  sequences_per_backbone:
+    type: integer
+    default: 4
+    description: >
+      Sequences designed for each backbone. A backbone counts as designable if
+      any of its sequences folds back to it, so this is how many chances each
+      one gets.
+  temperature:
+    type: number
+    default: 0.1
+    description: >
+      ProteinMPNN sampling temperature. Low keeps sequences near what the model
+      is most confident about, which is what a designability test wants.
+  max_scored:
+    type: integer
+    default: 8
+    description: >
+      How many of the best refolds get a physics score. Energy minimisation
+      is the expensive tail of this workflow, so it runs only on candidates
+      that already fold back to their backbone.
+  max_rendered:
+    type: integer
+    default: 4
+    description: How many of the best survivors to draw.
+
+steps:
+  # Unconditional: no target, nothing held fixed. Noise is left at the default
+  # 1.0 rather than the 0.0 a binder run uses, because a library of
+  # near-identical folds is not a library.
+  - id: backbones
+    tool: rfdiffusion/design_monomer
+    emits: designs
+    params:
+      length: ${inputs.length}
+      num_designs: ${inputs.num_backbones}
+
+  - id: sequences
+    tool: proteinmpnn/design_sequences
+    emits: designs
+    needs: [backbones]
+    for_each: backbones
+    params:
+      structure_uri: ${item.structure_uri}
+      design_chains: ${item.chain}
+      num_designs: ${inputs.sequences_per_backbone}
+      temperature: ${inputs.temperature}
+
+  # ESMFold2 rather than Boltz, and not as a compromise: a de novo protein has
+  # no homologues, so single sequence is the correct test here and an alignment
+  # search would be both slow and meaningless. It also refuses an alignment
+  # outright, so the test cannot quietly become an easier one.
+  - id: fold
+    tool: esmfold2/predict_complex
+    needs: [sequences]
+    for_each: sequences
+    params:
+      chains:
+        A: ${item.sequences.A}
+      samples: 1
+
+  # Self-consistency: does the predicted structure return to the backbone the
+  # sequence was designed for. TM-score rather than RMSD alone, because these
+  # backbones vary in length and a fixed RMSD in Angstroms is not comparable
+  # across them; above about 0.5 is the same fold, above 0.9 near-identical.
+  # US-align reports RMSD over the aligned residues too, so nothing is lost.
+  - id: selfconsistency
+    tool: usalign/compare_folds
+    needs: [fold]
+    for_each: fold
+    params:
+      reference_uri: ${item.carried.backbones.structure_uri}
+      subject_uris: ${item.best.structure_uri}
+
+  # The only non-neural judgement in the workflow. Every other number here is
+  # deep learning trained on overlapping data, so their agreement is weaker
+  # evidence than it looks; an energy function is wrong for unrelated reasons.
+  # For scale: a real crystal structure scores about -2.6 REU per residue.
+  #
+  # The refold is scored, never the diffusion backbone. Measured on one
+  # scaffold, the raw backbone came out at -0.18 REU per residue and its refold
+  # at -3.31: nothing optimised the backbone's local geometry, so an energy
+  # function is right to punish it and wrong to be asked. No side-chain packing
+  # step is needed either, because ESMFold2 already writes them; `faspr` is for
+  # scoring a bare backbone or repacking a mutant, neither of which is this.
+  - id: energy
+    tool: tmol/score_energy
+    needs: [selfconsistency]
+    for_each: selfconsistency
+    order_by: best.tm_score desc
+    limit: ${inputs.max_scored}
+    params:
+      structure_uri: ${item.carried.fold.best.structure_uri}
+
+  - id: picture
+    tool: render/render_structure
+    needs: [energy]
+    for_each: energy
+    order_by: energy_per_residue asc
+    limit: ${inputs.max_rendered}
+    params:
+      structure_uri: ${item.carried.fold.best.structure_uri}
+      spectrum: true
+
+output:
+  from: picture
+  order_by: carried.energy.energy_per_residue asc
+  select:
+    - carried.backbones.structure_uri
+    - carried.selfconsistency.best.tm_score
+    - carried.selfconsistency.best.rmsd
+    - carried.fold.best.complex_plddt
+    - carried.energy.energy_per_residue
+    - carried.fold.best.structure_uri
+    - images.0.uri

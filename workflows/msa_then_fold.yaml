@@ -1,0 +1,49 @@
+name: msa-then-fold
+description: >
+  Search an alignment for each target, then fold it.
+
+inputs:
+  targets:
+    type: array
+    required: true
+    description: One-letter sequences, one per complex to fold.
+  min_alignment_depth:
+    type: integer
+    default: 100
+    description: >
+      Skip a target whose alignment found fewer sequences than this. A de novo
+      design typically finds almost none, which is expected rather than a
+      failure, but folding it with an alignment gains nothing.
+  max_folds:
+    type: integer
+    default: 5
+    description: Ceiling on folds per run, so a large input cannot run away.
+
+steps:
+  - id: msa
+    tool: msa/search_msa
+    for_each: inputs.targets
+    params:
+      chains:
+        A: ${item}
+
+  - id: fold
+    tool: boltz/predict_complex
+    needs: [msa]
+    for_each: msa.results
+    where: alignments.A.num_sequences > ${inputs.min_alignment_depth}
+    order_by: alignments.A.num_sequences desc
+    limit: ${inputs.max_folds}
+    params:
+      chains: ${item.chains}
+      samples: 1
+
+output:
+  from: fold
+  order_by: best.confidence_score desc
+  select:
+    - run_id
+    - best.ptm
+    - best.iptm
+    - best.complex_plddt
+    - best.structure_uri

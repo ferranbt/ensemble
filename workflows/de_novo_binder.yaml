@@ -1,0 +1,100 @@
+name: de-novo-binder
+description: >
+  Design binders against a target from nothing: generate backbones, give them
+  sequences, refold each sequence from scratch, and keep the ones whose refold
+  returns to the backbone it was designed for.
+
+inputs:
+  target_uri:
+    type: string
+    required: true
+    description: The target structure in S3, `.pdb` or `.cif`.
+  target_chain:
+    type: string
+    default: A
+    description: Which chain of the target to bind. Every other chain is dropped.
+  hotspots:
+    type: array
+    default: []
+    description: >
+      Target residues the binder should contact, in the file's own numbering,
+      e.g. ["A30","A33"]. The main steering control: without it the model picks
+      where to bind, which is rarely what you want.
+  binder_length:
+    type: string
+    default: "70-100"
+    description: Residues to generate, as "80" or a range that varies per design.
+  num_backbones:
+    type: integer
+    default: 4
+    description: How many backbones to generate.
+  sequences_per_backbone:
+    type: integer
+    default: 4
+    description: Sequences designed for each backbone.
+  max_folds:
+    type: integer
+    default: 8
+    description: >
+      Ceiling on refolds. Folding is the expensive step, so this is the cost
+      control for the whole run.
+
+steps:
+  - id: backbones
+    tool: rfdiffusion/design_binder_backbone
+    emits: designs
+    params:
+      target_uri: ${inputs.target_uri}
+      target_chain: ${inputs.target_chain}
+      hotspots: ${inputs.hotspots}
+      binder_length: ${inputs.binder_length}
+      num_designs: ${inputs.num_backbones}
+
+  - id: sequences
+    tool: proteinmpnn/design_sequences
+    emits: designs
+    needs: [backbones]
+    for_each: backbones
+    params:
+      structure_uri: ${item.structure_uri}
+      design_chains: ${item.binder_chain}
+      num_designs: ${inputs.sequences_per_backbone}
+
+  - id: fold
+    tool: boltz/predict_complex
+    needs: [sequences]
+    for_each: sequences
+    order_by: score asc
+    limit: ${inputs.max_folds}
+    params:
+      chains: ${item.sequences}
+      default_msa: colabfold
+      samples: 1
+
+  - id: selfconsistency
+    tool: rmsd/compare_structures
+    needs: [fold]
+    for_each: fold
+    params:
+      reference_uri: ${item.carried.backbones.structure_uri}
+      subject_uri: ${item.best.structure_uri}
+      align: ${inputs.target_chain}
+      measure: ${item.carried.sequences.binder_chain}
+
+  - id: interface
+    tool: ipsae/score_interface
+    needs: [selfconsistency]
+    for_each: selfconsistency
+    params:
+      structure_uri: ${item.subject_uri}
+
+output:
+  from: interface
+  order_by: best.ipSAE desc
+  select:
+    - carried.selfconsistency.rmsd
+    - carried.selfconsistency.align_rmsd
+    - best.ipSAE
+    - best.pDockQ
+    - carried.backbones.structure_uri
+    - structure_uri

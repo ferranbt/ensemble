@@ -1,0 +1,72 @@
+name: binder-screen
+description: >
+  Score candidate binders against one target: search the target's alignment
+  once, fold each target-plus-candidate complex, score the interface, return
+  the best.
+
+inputs:
+  target:
+    type: string
+    required: true
+    description: The target's one-letter sequence. Chain A of every complex.
+  binders:
+    type: array
+    required: true
+    description: Candidate binder sequences. Each becomes chain B of its own fold.
+  max_folds:
+    type: integer
+    default: 5
+    description: Ceiling on folds per run, so a large candidate list cannot run away.
+  min_interface:
+    type: number
+    default: 0.0
+    description: >
+      Drop folds whose predicted interface confidence is below this before
+      scoring them properly. Zero keeps everything, which is the right default
+      until you have calibrated a threshold for a given target.
+
+steps:
+  - id: msa
+    tool: msa/search_msa
+    params:
+      chains:
+        A: ${inputs.target}
+
+  # Each chain gets its own alignment or none. Handing one chain another's
+  # alignment predicts without complaining and costs real accuracy: measured
+  # on barnase-barstar, ipSAE 0.94 aligned per chain against 0.68 shared.
+  - id: fold
+    tool: boltz/predict_complex
+    needs: [msa]
+    for_each: inputs.binders
+    limit: ${inputs.max_folds}
+    params:
+      chains:
+        A:
+          sequence: ${inputs.target}
+          msa: ${msa.results.0.chains.A.msa}
+        B: ${item}
+      samples: 1
+
+  # One reference: the aligned error matrix and the confidence array live
+  # beside the structure under a shared naming convention and are found from
+  # its URI alone. Passing them separately is how they went out of step.
+  - id: score
+    tool: ipsae/score_interface
+    needs: [fold]
+    for_each: fold.results
+    where: best.iptm >= ${inputs.min_interface}
+    params:
+      structure_uri: ${item.best.structure_uri}
+
+output:
+  from: score
+  order_by: best.ipSAE desc
+  select:
+    - run_id
+    - best.Chn1
+    - best.Chn2
+    - best.ipSAE
+    - best.ipTM_af
+    - best.pDockQ
+    - structure_uri

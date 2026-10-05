@@ -1,0 +1,135 @@
+name: thermostabilize
+description: >
+  Make an existing protein more stable without redesigning it. Three scanners
+  score every point substitution, the ones at least two of them rank highly
+  become variants, and every variant plus the unchanged parent is sampled as an
+  equilibrium ensemble to predict the change in stability.
+
+inputs:
+  structure_uri:
+    type: string
+    required: true
+    description: The protein to stabilise, in S3, `.pdb` or `.cif`.
+  chain:
+    type: string
+    default: A
+    description: Which chain to work on. One chain per run.
+  sequence:
+    type: string
+    required: true
+    description: >
+      That chain's one-letter sequence. Supplied rather than derived because
+      two of the three scanners read a sequence and one reads a structure, and
+      they have to describe the same residues. It must be the chain's
+      *observed* sequence, the residues actually present in the file: a SEQRES
+      sequence including unresolved residues would not line up against the
+      structure the scans and the reference contact map come from.
+  scan_depth:
+    type: integer
+    default: 8
+    description: Substitutions each scanner reports per position.
+  top_per_source:
+    type: integer
+    default: 50
+    description: >
+      How many of each scanner's best substitutions are considered. A
+      shortlist size, not a claim about what counts as stabilising.
+  min_sources:
+    type: integer
+    default: 2
+    description: How many scanners must independently rank a substitution highly.
+  max_mutations:
+    type: integer
+    default: 6
+    description: Ceiling on mutations in the largest stacked variant.
+  num_samples:
+    type: integer
+    default: 100
+    description: >
+      Structures sampled per variant. This is the resolution of the free
+      energy: a hundred is enough to separate a stable variant from a broken
+      one, and more is needed to resolve small differences between variants
+      that are all fine.
+
+steps:
+  - id: alignment
+    tool: msa/search_msa
+    params:
+      chains:
+        A: ${inputs.sequence}
+
+  # Energetic: what does the fold tolerate. Ascending by default, so the
+  # best-tolerated substitutions come first.
+  - id: stability
+    tool: thermompnn/scan_stability
+    params:
+      structure_uri: ${inputs.structure_uri}
+      chain: ${inputs.chain}
+      top_k: ${inputs.scan_depth}
+
+  # Evolutionary: what does nature use at this position.
+  - id: likelihood
+    tool: esm/scan_mutations
+    params:
+      sequence: ${inputs.sequence}
+      top_k: ${inputs.scan_depth}
+
+  # Structural: what does the local backbone want.
+  - id: structural
+    tool: proteinmpnn/residue_probabilities
+    params:
+      structure_uri: ${inputs.structure_uri}
+      chains: ${inputs.chain}
+      top_k: ${inputs.scan_depth}
+
+  - id: propose
+    tool: variants/propose_variants
+    needs: [stability, likelihood, structural]
+    emits: variants
+    params:
+      sequence: ${inputs.sequence}
+      scans:
+        - label: thermompnn
+          type: stability
+          positions: ${stability.results.0.positions}
+        - label: esm2
+          type: likelihood
+          positions: ${likelihood.results.0.positions}
+        - label: proteinmpnn
+          type: structural
+          positions: ${structural.results.0.positions}
+      min_sources: ${inputs.min_sources}
+      top_per_source: ${inputs.top_per_source}
+      max_mutations: ${inputs.max_mutations}
+
+  # This replaces refolding. A single prediction reports pLDDT, which is the
+  # model's confidence in its own answer and not a stability; ranking variants
+  # on it says nothing about whether they are more stable. BioEmu samples the
+  # states the protein actually populates and its free energy comes from a
+  # fitted estimator, so the number means what the workflow claims to measure.
+  #
+  # It is also independent of what selected these mutations. ThermoMPNN's ddG
+  # chose them, so re-reporting ThermoMPNN would be circular; BioEmu had no
+  # part in choosing and can disagree.
+  - id: ensemble
+    tool: bioemu/sample_ensemble
+    needs: [propose, alignment]
+    for_each: propose
+    params:
+      sequence: ${item.sequence}
+      msa: ${alignment.results.0.chains.A.msa}
+      reference_uri: ${inputs.structure_uri}
+      reference_chain: ${inputs.chain}
+      num_samples: ${inputs.num_samples}
+
+output:
+  from: ensemble
+  order_by: observables.free_energy_kcal_mol asc
+  select:
+    - carried.propose.mutations
+    - carried.propose.num_mutations
+    - carried.propose.is_parent
+    - observables.free_energy_kcal_mol
+    - observables.native_contacts_mean
+    - observables.rmsf_mean
+    - trajectory_uri
