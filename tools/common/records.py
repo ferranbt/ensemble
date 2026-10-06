@@ -114,13 +114,16 @@ class Runtime:
 
 
 def _connect():
-    """A connection, or None when no database is configured."""
     url = os.environ.get(URL_ENV, "").strip()
     if not url:
         return None
     import psycopg
 
-    return psycopg.connect(url, autocommit=True, connect_timeout=10)
+    try:
+        return psycopg.connect(url, autocommit=True, connect_timeout=10)
+    except Exception as exc:  # noqa: BLE001 - never fail a call over a record
+        print(f"[records] no database, not recording: {exc}", flush=True)
+        return None
 
 
 def _json(value: Any) -> str:
